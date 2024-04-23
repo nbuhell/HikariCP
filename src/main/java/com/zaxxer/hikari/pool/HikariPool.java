@@ -663,12 +663,26 @@ public final class HikariPool extends PoolBase implements HikariPoolMXBean, IBag
       if (originalException instanceof SQLException) {
          sqlState = ((SQLException) originalException).getSQLState();
       }
-      final SQLException connectionException = new SQLTransientConnectionException(poolName + " - Connection is not available, request timed out after " + elapsedMillis(startTime) + "ms.", sqlState, originalException);
+      final SQLException connectionException = new SQLTransientConnectionException(poolName + " - Connection is not available, request timed out after " + elapsedMillis(startTime) + "ms. state:" + strPoolState(), sqlState, originalException);
       if (originalException instanceof SQLException) {
          connectionException.setNextException((SQLException) originalException);
       }
 
       return connectionException;
+   }
+
+   private String strPoolState() {
+      PoolStats ps = getPoolStats();
+      StringBuilder sb = new StringBuilder();
+      sb.append("IdleConnections:").
+         append(ps.getIdleConnections()).
+         append("ActiveConnections:").
+         append(ps.getActiveConnections()).
+         append("getMaxConnections:").
+         append(ps.getMaxConnections()).
+         append("getPendingThreads:").
+         append(ps.getPendingThreads());
+      return sb.toString();
    }
 
 
