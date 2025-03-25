@@ -39,15 +39,7 @@ import java.sql.SQLTransientConnectionException;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.*;
 
 import static com.zaxxer.hikari.util.ClockSource.currentTime;
 import static com.zaxxer.hikari.util.ClockSource.elapsedDisplayString;
@@ -87,7 +79,7 @@ public final class HikariPool extends PoolBase implements HikariPoolMXBean, IBag
    private final PoolEntryCreator poolEntryCreator = new PoolEntryCreator(null /*logging prefix*/);
    private final PoolEntryCreator postFillPoolEntryCreator = new PoolEntryCreator("After adding ");
    private final Collection<Runnable> addConnectionQueueReadOnlyView;
-   private final ThreadPoolExecutor addConnectionExecutor;
+   private ThreadPoolExecutor addConnectionExecutor;
    private final ThreadPoolExecutor closeConnectionExecutor;
 
    private final ConcurrentBag<PoolEntry> connectionBag;
@@ -97,6 +89,8 @@ public final class HikariPool extends PoolBase implements HikariPoolMXBean, IBag
 
    private final ScheduledExecutorService houseKeepingExecutorService;
    private ScheduledFuture<?> houseKeeperTask;
+
+   private CheckHangs checkHangs;
 
    /**
     * Construct a HikariPool with the specified configuration.
@@ -149,6 +143,8 @@ public final class HikariPool extends PoolBase implements HikariPoolMXBean, IBag
          addConnectionExecutor.setCorePoolSize(1);
          addConnectionExecutor.setMaximumPoolSize(1);
       }
+
+      this.checkHangs = new CheckHangs();
    }
 
    /**
@@ -520,6 +516,15 @@ public final class HikariPool extends PoolBase implements HikariPoolMXBean, IBag
       for (int i = 0; i < connectionsToAdd; i++) {
          addConnectionExecutor.submit((i < connectionsToAdd - 1) ? poolEntryCreator : postFillPoolEntryCreator);
       }
+
+      if (connectionsToAdd <= 0 && shouldCreateAnotherConnection() && addConnectionQueueReadOnlyView.size() > 0) {
+         this.checkHangs.maybehangs();
+      }
+   }
+
+   private boolean shouldCreateAnotherConnection() {
+      return getTotalConnections() < config.getMaximumPoolSize() &&
+         (connectionBag.getWaitingThreadCount() > 0 || getIdleConnections() < config.getMinimumIdle());
    }
 
    /**
@@ -693,12 +698,26 @@ public final class HikariPool extends PoolBase implements HikariPoolMXBean, IBag
       if (originalException instanceof SQLException) {
          sqlState = ((SQLException) originalException).getSQLState();
       }
-      final SQLException connectionException = new SQLTransientConnectionException(poolName + " - Connection is not available, request timed out after " + elapsedMillis(startTime) + "ms.", sqlState, originalException);
+      final SQLException connectionException = new SQLTransientConnectionException(poolName + " - Connection is not available, request timed out after " + elapsedMillis(startTime) + "ms."+" state:" + strPoolState(), sqlState, originalException);
       if (originalException instanceof SQLException) {
          connectionException.setNextException((SQLException) originalException);
       }
 
       return connectionException;
+   }
+
+   private String strPoolState() {
+      PoolStats ps = getPoolStats();
+      StringBuilder sb = new StringBuilder();
+      sb.append("IdleConnections:").
+         append(ps.getIdleConnections()).
+         append("ActiveConnections:").
+         append(ps.getActiveConnections()).
+         append("getMaxConnections:").
+         append(ps.getMaxConnections()).
+         append("getPendingThreads:").
+         append(ps.getPendingThreads());
+      return sb.toString();
    }
 
 
@@ -868,5 +887,40 @@ public final class HikariPool extends PoolBase implements HikariPoolMXBean, IBag
       {
          super("Failed to initialize pool: " + t.getMessage(), t);
       }
+   }
+
+   private final class CheckHangs {
+      private int times = 0;
+      private int qsize;
+      private int tc;
+
+      public void maybehangs() {
+         try {
+            if (this.times == 0) {
+               this.qsize = addConnectionQueueReadOnlyView.size();
+               this.tc = getTotalConnections();
+               times++;
+            } else {
+               if (this.qsize == addConnectionQueueReadOnlyView.size() && this.tc == getTotalConnections() &&
+                  getTotalConnections() < config.getMinimumIdle()) {
+                  dealHangs();
+               }
+               this.times = 0;
+            }
+         } catch (InterruptedException ie) {
+         } catch (Exception e) {
+            e.printStackTrace();
+         }
+      }
+   }
+
+   private void dealHangs() throws InterruptedException {
+      this.checkFailFast();
+      BlockingQueue<Runnable> queue = this.addConnectionExecutor.getQueue();
+      ThreadFactory threadFactory = this.addConnectionExecutor.getThreadFactory();
+      this.addConnectionExecutor.shutdownNow();
+      this.addConnectionExecutor.awaitTermination(5, SECONDS);
+      queue.clear();
+      this.addConnectionExecutor = createThreadPoolExecutor(queue, poolName + " connection adder", threadFactory, new ThreadPoolExecutor.DiscardOldestPolicy());
    }
 }
