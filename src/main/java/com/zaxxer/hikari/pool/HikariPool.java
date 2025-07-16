@@ -676,12 +676,20 @@ public final class HikariPool extends PoolBase implements HikariPoolMXBean, IBag
       StringBuilder sb = new StringBuilder();
       sb.append("IdleConnections:").
          append(ps.getIdleConnections()).
-         append("ActiveConnections:").
+         append("|ActiveConnections:").
          append(ps.getActiveConnections()).
-         append("getMaxConnections:").
+         append("|MaxConnections:").
          append(ps.getMaxConnections()).
-         append("getPendingThreads:").
-         append(ps.getPendingThreads());
+         append("|PendingThreads:").
+         append(ps.getPendingThreads()).
+         append("|TotalConnections:").
+         append(getTotalConnections()).
+         append("|MinConnections:").
+         append(ps.getMinConnections());
+
+      if (ps.getPendingThreads() > 0 && (ps.getActiveConnections() + ps.getIdleConnections()) < ps.getMaxConnections()) {
+         this.checkHangs.maybehangs2();
+      }
       return sb.toString();
    }
 
@@ -808,8 +816,10 @@ public final class HikariPool extends PoolBase implements HikariPoolMXBean, IBag
 
    private final class CheckHangs {
       private int times = 0;
+      private int times2 = 0;
       private int qsize;
       private int tc;
+      private int waters=0;
 
       public void maybehangs() {
          try {
@@ -819,9 +829,11 @@ public final class HikariPool extends PoolBase implements HikariPoolMXBean, IBag
                times++;
                logger.warn("check maybehangs");
             } else {
-               boolean flag = this.qsize == addConnectionQueueReadOnlyView.size()
+               boolean flag = this.qsize <= addConnectionQueueReadOnlyView.size()
                   && this.tc == getTotalConnections()
-                  && getTotalConnections() < config.getMinimumIdle();
+                  && (getTotalConnections() < config.getMinimumIdle()
+                  || (getTotalConnections() < config.getMaximumPoolSize()
+                  && getThreadsAwaitingConnection() > 0));
                if (flag) {
                   dealHangs();
                }
@@ -829,6 +841,20 @@ public final class HikariPool extends PoolBase implements HikariPoolMXBean, IBag
             }
          } catch (Exception e) {
             e.printStackTrace();
+         }
+      }
+
+      public void maybehangs2() {
+         if (this.times2 == 0) {
+            this.waters = getThreadsAwaitingConnection();
+            if (getThreadsAwaitingConnection() > 0 && getTotalConnections() < config.getMaximumPoolSize()) {
+               this.times2++;
+            }
+         } else {
+            if (getThreadsAwaitingConnection() > this.waters && getTotalConnections() < config.getMaximumPoolSize()) {
+               dealHangs();
+            }
+            this.times2 = 0;
          }
       }
    }
